@@ -1,4 +1,1 @@
-requests
-bs4
-logging
-aiohttp
+httpx>=0.27.0

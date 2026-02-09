@@ -1,644 +1,976 @@
+#!/usr/bin/env python3
 """
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Discord Favorite GIF Downloader
+Async downloader for Discord favorite GIFs from protobuf data
 Author: nloginov
-Script Name: Discord Favorite Gif Downloader (Async Version)
 """
 
 import asyncio
-import aiohttp
+import httpx
 import base64
-import re
-import os
-from bs4 import BeautifulSoup
-import logging
-import time
 import json
-from collections import defaultdict
-import hashlib
-from urllib.parse import urlparse, urlunparse, unquote, parse_qs
-import ssl
+import os
+import logging
+from pathlib import Path
+from typing import List, Tuple, Optional, Set, Dict, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+import sys
+import re
+from urllib.parse import urlparse, unquote, parse_qs, urlunparse
+import mimetypes
+import html
+import time
+import random
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# Global counters and error tracking
-total_urls = 0
-successful_downloads = 0
-failed_downloads = 0
-error_summary = defaultdict(list)
-detailed_errors = {
-    "429": [],
-    "404": [],
-    "content-type": [],
-    "other": []
-}
+# Suppress httpx debug logs
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
-# Async configuration
-MAX_CONCURRENT_DOWNLOADS = 5  # Reduced to prevent overwhelming servers
-MAX_RETRIES = 2  # Reduced retry attempts
-RETRY_DELAY = 5  # Reduced delay
-REQUEST_TIMEOUT = 20  # Reduced timeout
-
-# Locks for thread-safe operations
-download_lock = asyncio.Lock()
-
-def ensure_directory(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-def extract_and_fix_urls(text):
-    """Extract and repair malformed URLs from Discord's decrypted base64 favorite GIFs data."""
-    pattern = r'(?:https?:?/?/?|ftp:?/?/?|www\.)[a-zA-Z0-9\-._~:/?#[\]@!$&\'()*+,;=%]+'
-    urls = re.findall(pattern, text)
-    
-    fixed_urls = []
-    for url in urls:
-        try:
-            # Fix protocol issues
-            if url.startswith('http/'): url = 'http://' + url[5:]
-            elif url.startswith('https/'): url = 'https://' + url[6:]
-            elif url.startswith('ftp/'): url = 'ftp://' + url[4:]
-            elif url.startswith('www.'): url = 'https://' + url
-            
-            # Fix slash issues
-            url = re.sub(r'^(https?|ftp):/{3,}', r'\1://', url)
-            url = re.sub(r'^(https?|ftp):(?!/)', r'\1://', url)
-            
-            # Handle Discord external URLs
-            if 'discordapp.net/external/' in url or 'discord.com/external/' in url:
-                extracted_urls = extract_discord_external_url(url)
-                if extracted_urls:
-                    fixed_urls.extend(extracted_urls)
-                    continue
-            
-            # Handle Discord CDN URLs
-            if ('cdn.discordapp.com' in url or 'media.discordapp.net' in url) and not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-            
-            # Handle double URL encoding
-            prev_url = ""
-            while prev_url != url and '%' in url:
-                prev_url = url
-                url = unquote(url)
-            
-            # Clean up malformations
-            url = re.sub(r'["\'\s]+$', '', url)  # Remove trailing quotes/spaces
-            url = url.replace('\\/', '/').replace('\\"', '"')  # Fix escaped chars
-            url = re.sub(r'(?<!:)//+', '/', url)  # Remove duplicate slashes
-            url = re.sub(r'&amp;', '&', url)  # Fix HTML entities
-            
-            # Final validation
-            parsed = urlparse(url)
-            if (parsed.scheme in ('http', 'https', 'ftp') and 
-                parsed.netloc and 
-                '.' in parsed.netloc and 
-                not parsed.netloc.startswith('.') and 
-                not parsed.netloc.endswith('.') and
-                re.match(r'^[a-zA-Z0-9\-._]+$', parsed.netloc.split(':')[0])):
-                fixed_urls.append(parsed.geturl())
-        except:
-            continue
-    
-    return list(dict.fromkeys(fixed_urls))  # Remove duplicates
-
-def extract_discord_external_url(url):
-    """Improved Discord external URL extraction"""
-    try:
-        # Parse the URL
-        parsed = urlparse(url)
-        
-        # Method 1: Extract from path
-        if '/external/' in parsed.path:
-            # Split path and get everything after /external/
-            path_parts = parsed.path.split('/external/')
-            if len(path_parts) > 1:
-                remaining_path = path_parts[1]
-                # Remove the hash part (first segment) and get the actual URL
-                segments = remaining_path.split('/')
-                if len(segments) > 1:
-                    # The actual URL starts after the hash
-                    actual_url = '/'.join(segments[1:])
-                    # URL decode it
-                    decoded_url = unquote(actual_url)
-                    if decoded_url.startswith(('http://', 'https://')):
-                        return [decoded_url]
-        
-        # Method 2: Look for embedded URLs in the entire string
-        # Find all potential URLs in the string
-        url_patterns = [
-            r'https?://[^\s/?#]+[^\s]*',
-            r'(?:https?://)?(?:www\.)?[a-zA-Z0-9\-._~:/?#[\]@!$&\'()*+,;=%]+\.(?:gif|jpg|jpeg|png|mp4|webm)'
-        ]
-        
-        for pattern in url_patterns:
-            matches = re.findall(pattern, url)
-            for match in matches:
-                if match.startswith(('http://', 'https://')) and match != url:
-                    # Decode multiple times if needed
-                    decoded_match = match
-                    for _ in range(3):  # Max 3 decode attempts
-                        try:
-                            new_decoded = unquote(decoded_match)
-                            if new_decoded == decoded_match:
-                                break
-                            decoded_match = new_decoded
-                        except:
-                            break
-                    
-                    # Validate the extracted URL
-                    try:
-                        parsed_match = urlparse(decoded_match)
-                        if (parsed_match.scheme in ('http', 'https') and 
-                            parsed_match.netloc and 
-                            '.' in parsed_match.netloc):
-                            return [decoded_match]
-                    except:
-                        continue
-        
-        # Method 3: Query parameters
-        if parsed.query:
-            query_params = parse_qs(parsed.query)
-            for param in ['url', 'uri', 'source', 'image']:
-                if param in query_params:
-                    value = query_params[param][0]
-                    decoded_value = unquote(value)
-                    if decoded_value.startswith(('http://', 'https://')):
-                        return [decoded_value]
-
-        # Method 4: Fragment
-        if parsed.fragment:
-            fragment = unquote(parsed.fragment)
-            if fragment.startswith(('http://', 'https://')):
-                return [fragment]
-                
-    except Exception as e:
-        logger.debug(f"Error parsing Discord external URL {url}: {e}")
-    
-    return None
-
-async def get_imgur_url(session, imgur_url):
-    try:
-        # First try to get as text (for HTML pages)
-        try:
-            async with session.get(imgur_url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as response:
-                if response.status == 200:
-                    content_type = response.headers.get('Content-Type', '').lower()
-                    
-                    if 'text/html' in content_type:
-                        content = await response.text()
-                        
-                        # Clean URL by removing query parameters and fragments
-                        def clean_url(url):
-                            if not url:
-                                return None
-                            parsed = urlparse(url)
-                            return urlunparse(parsed._replace(query='', fragment=''))
-
-                        # Try to extract JSON data (for gallery pages)
-                        json_match = re.search(r'window\.postDataJSON="({.+?})"', content)
-                        if json_match:
-                            try:
-                                data = json.loads(json_match.group(1).replace('\\"', '"'))
-                                if data.get('is_album', False) and 'media' in data:
-                                    return [clean_url(item.get('url')) for item in data['media'] if item.get('url')]
-                            except (json.JSONDecodeError, AttributeError):
-                                pass
-
-                        # For all album types (/a/ and /gallery/), look for meta tags and embedded images
-                        image_urls = set()
-
-                        # Check OpenGraph meta tags
-                        og_image_match = re.search(r'<meta property="og:image" [^>]*content="([^"]+)"', content)
-                        if og_image_match:
-                            image_urls.add(clean_url(og_image_match.group(1)))
-
-                        # Check Twitter card meta tags
-                        twitter_image_match = re.search(r'<meta name="twitter:image" [^>]*content="([^"]+)"', content)
-                        if twitter_image_match:
-                            image_urls.add(clean_url(twitter_image_match.group(1)))
-
-                        # Find all direct image links in the page
-                        direct_urls = re.findall(r'https://i\.imgur\.com/\w+\.(?:jpg|png|gif|jpeg|mp4)', content)
-                        image_urls.update(clean_url(url) for url in direct_urls)
-
-                        # If we found any URLs, return them (remove None values)
-                        found_urls = [url for url in image_urls if url]
-                        if found_urls:
-                            return found_urls
-                            
-        except UnicodeDecodeError:
-            # If we get a decoding error, it's probably binary data - treat as direct image
-            pass
-
-        # If nothing found or decoding failed, try to construct URL from ID
-        imgur_id = imgur_url.split('/')[-1].split('.')[0]  # Handle cases with extensions
-        return [f'https://i.imgur.com/{imgur_id}.jpg']
-
-    except Exception as e:
-        logger.debug(f"Error fetching Imgur URL {imgur_url}: {e}")
-        return None
-
-
-async def get_tenor_gif_url(session, tenor_url):
-    """Extract direct GIF URL from Tenor page"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive'
-        }
-
-        try:
-            async with session.get(tenor_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    content_type = response.headers.get('Content-Type', '').lower()
-                    
-                    if 'text/html' in content_type:
-                        content = await response.text()
-                        
-                        # Method 1: Extract from meta tag contentUrl
-                        content_url_pattern = r'<meta itemprop="contentUrl" content="([^"]+)"'
-                        content_url_match = re.search(content_url_pattern, content)
-                        if content_url_match:
-                            return content_url_match.group(1)
-                        
-                        # Method 2: Extract from img src in the main gif container
-                        img_pattern = r'<img src="(https://media[0-9]*\.tenor\.com/[^"]+\.gif)"[^>]*alt="[^"]*"[^>]*fetchpriority="high"'
-                        img_match = re.search(img_pattern, content)
-                        if img_match:
-                            return img_match.group(1)
-                        
-                        # Method 3: Extract any media URL from the content
-                        media_pattern = r'https://media[0-9]*\.tenor\.com/[^"\'>\s]+\.(?:gif|mp4|webm)'
-                        media_matches = re.findall(media_pattern, content)
-                        if media_matches:
-                            # Prefer GIF over other formats
-                            gif_urls = [url for url in media_matches if url.endswith('.gif')]
-                            if gif_urls:
-                                return gif_urls[0]
-                            return media_matches[0]
-                        
-                        # Method 4: Extract from clipboard data attributes
-                        clipboard_pattern = r'data-clipboard-text="(https://media[0-9]*\.tenor\.com/[^"]+\.gif)"'
-                        clipboard_match = re.search(clipboard_pattern, content)
-                        if clipboard_match:
-                            return clipboard_match.group(1)
-        except UnicodeDecodeError:
-            # If we get a decoding error, it's probably binary data - treat as direct image
-            pass
-
-    except Exception as e:
-        print(f"Error fetching Tenor URL {tenor_url}: {e}")
-    
-    return None
-
-CONTENT_TYPES = {
+# Media type mappings
+MEDIA_TYPES = {
     'image/gif': ('.gif', 'gif'),
     'video/mp4': ('.mp4', 'mp4'),
     'image/png': ('.png', 'img'),
     'image/jpeg': ('.jpg', 'img'),
-    'video/webm': ('.webm', 'webm'),
-    'image/webp': ('.webp', 'img')
+    'image/jpg': ('.jpg', 'img'),
+    'video/webm': ('.webm', 'mp4'),
+    'image/webp': ('.webp', 'img'),
+    'video/quicktime': ('.mov', 'mp4'),
 }
 
-SUPPORTED_EXTENSIONS = tuple(ext for ext, _ in CONTENT_TYPES.values())
+# Rate limiting configuration
+RATE_LIMIT_DELAY = 0.1
+MAX_REQUESTS_PER_DOMAIN = 10
+REQUEST_TIMEOUT = 30
 
-def get_extension_and_subfolder(content_type, direct_url):
-    for mime, (ext, subfolder) in CONTENT_TYPES.items():
-        if mime in content_type or direct_url.lower().endswith(ext):
-            return ext, subfolder
-    return None, None
+# Domain-specific delays
+DOMAIN_DELAYS = {
+    'tenor.com': 0.2,
+    'imgur.com': 0.2,
+    'giphy.com': 0.2,
+    'discordapp.com': 0.15,
+    'discordapp.net': 0.15,
+    'media.discordapp.net': 0.15,
+    'cdn.discordapp.com': 0.15,
+}
 
-def safe_filename(filename, max_length=200):
-    # Remove invalid characters
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+
+@dataclass
+class DownloadStats:
+    """Track download statistics"""
+    total: int = 0
+    successful: int = 0
+    failed: int = 0
+    skipped: int = 0
+    resolved: int = 0
+    unsupported: int = 0
+    rate_limited: int = 0
+    not_found: int = 0  # 404 errors
+    errors: List[str] = field(default_factory=list)
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    downloaded_files: List[str] = field(default_factory=list)
+    failed_urls: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def success_rate(self) -> float:
+        return (self.successful / self.total * 100) if self.total > 0 else 0
+
+    @property
+    def duration(self) -> float:
+        if self.start_time and self.end_time:
+            return (self.end_time - self.start_time).total_seconds()
+        return 0
+
+    def add_error(self, url: str, error: str):
+        # Clean the URL for display
+        display_url = url[:80] + "..." if len(url) > 80 else url
+        self.errors.append(f"{display_url}: {error}")
+        self.failed_urls[url] = error
+        
+        # Count specific error types
+        if "404" in error or "Not Found" in error:
+            self.not_found += 1
+
+
+class RateLimiter:
+    """Rate limiter to avoid getting blocked"""
     
-    # Truncate if too long, but keep the extension
-    name, ext = os.path.splitext(filename)
-    if len(name) > max_length:
-        # Use a hash of the full name to ensure uniqueness
-        name_hash = hashlib.md5(name.encode()).hexdigest()[:8]
-        name = name[:max_length-9] + '_' + name_hash
+    def __init__(self):
+        self.domain_timestamps: Dict[str, List[float]] = {}
+        self.domain_semaphores: Dict[str, asyncio.Semaphore] = {}
     
-    return name + ext
-
-def should_retry(status_code, error_type, error_message):
-    """Determine if we should retry based on the error"""
-    if status_code == 429:  # Too Many Requests
-        return True
-    if status_code in [502, 503, 504]:  # Server errors
-        return True
-    if "timeout" in str(error_message).lower():
-        return True
-    if "connection" in str(error_message).lower():
-        return True
-    return False
-
-async def download_media(session, url, retry_count=0):
-    global successful_downloads, failed_downloads
+    async def wait_for_domain(self, domain: str):
+        """Wait before making a request to a domain"""
+        now = time.time()
+        
+        if domain not in self.domain_semaphores:
+            self.domain_semaphores[domain] = asyncio.Semaphore(MAX_REQUESTS_PER_DOMAIN)
+        
+        delay = DOMAIN_DELAYS.get(domain, RATE_LIMIT_DELAY)
+        
+        # Check last request time
+        if domain in self.domain_timestamps:
+            timestamps = self.domain_timestamps[domain]
+            if timestamps:
+                last_time = timestamps[-1]
+                time_since = now - last_time
+                if time_since < delay:
+                    await asyncio.sleep(delay - time_since + random.uniform(0, 0.03))
+        
+        # Update timestamps
+        if domain not in self.domain_timestamps:
+            self.domain_timestamps[domain] = []
+        self.domain_timestamps[domain].append(time.time())
+        
+        # Keep only recent timestamps
+        self.domain_timestamps[domain] = [t for t in self.domain_timestamps[domain] if now - t < 60]
+        
+        # Acquire semaphore
+        return await self.domain_semaphores[domain].acquire()
     
-    try:
-        # First handle special cases (Imgur, Tenor)
-        if 'imgur.com' in url:
-            imgur_urls = await get_imgur_url(session, url)
-            if not imgur_urls:
-                async with download_lock:
-                    failed_downloads += 1
-                    error_summary["Imgur URL skipped"].append(url)
-                    detailed_errors["other"].append({
-                        "link": url,
-                        "reason": "Failed to extract Imgur URL"
-                    })
-                return
-                
-            if isinstance(imgur_urls, list) and len(imgur_urls) > 1:  # It's an album
-                # Create tasks for all images in the album
-                tasks = [download_media(session, imgur_url) for imgur_url in imgur_urls]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                return
-            else:  # Single image/video
-                direct_url = imgur_urls[0] if isinstance(imgur_urls, list) else imgur_urls
-                
-        elif 'tenor.com' in url:
-            gif_url = await get_tenor_gif_url(session, url)
-            if not gif_url:
-                async with download_lock:
-                    failed_downloads += 1
-                    error_summary["Tenor URL skipped"].append(url)
-                    detailed_errors["other"].append({
-                        "link": url,
-                        "reason": "Failed to extract Tenor URL"
-                    })
-                return
-            direct_url = gif_url
-            
-        elif url.lower().endswith(SUPPORTED_EXTENSIONS):
-            direct_url = url
-        else:
-            direct_url = url
+    def release_domain(self, domain: str):
+        """Release semaphore after request"""
+        if domain in self.domain_semaphores:
+            self.domain_semaphores[domain].release()
 
-        # Special handling for Discord external URLs that might still have tracking parameters
-        if 'discordapp.net/external/' in direct_url or 'discord.com/external/' in direct_url:
-            # Try to extract the final URL again
-            extracted_urls = extract_discord_external_url(direct_url)
-            if extracted_urls and extracted_urls[0] != direct_url:
-                return await download_media(session, extracted_urls[0], retry_count)
 
-        # Create SSL context that's more permissive for retries
-        ssl_context = None
-        if retry_count > 0:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+class URLResolver:
+    """Resolve special URLs to direct media URLs"""
+    
+    def __init__(self, rate_limiter: RateLimiter):
+        self.rate_limiter = rate_limiter
+    
+    @staticmethod
+    def clean_url(url: str) -> str:
+        """Clean and normalize URL"""
+        if not url:
+            return url
         
-        async with session.get(
-            direct_url,
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ssl=ssl_context
-        ) as response:
-            # Handle redirects
-            if response.status in (301, 302, 303, 307, 308):
-                redirect_url = response.headers.get('Location')
-                if redirect_url:
-                    if retry_count < MAX_RETRIES:
-                        logger.debug(f"Following redirect from {direct_url} to {redirect_url}")
-                        return await download_media(session, redirect_url, retry_count + 1)
-                    else:
-                        raise Exception(f"Too many redirects for {url}")
-            
-            response.raise_for_status()
-            
-            content_type = response.headers.get('Content-Type', '').lower()
-            
-            extension, subfolder = get_extension_and_subfolder(content_type, direct_url)
-            if not extension:
-                async with download_lock:
-                    failed_downloads += 1
-                    error_summary["Unsupported content type"].append(f"{content_type} - {direct_url}")
-                    detailed_errors["content-type"].append({
-                        "link": direct_url,
-                        "content-type": content_type
-                    })
-                return
-
-            parsed_url = urlparse(unquote(direct_url))
-            filename = os.path.basename(parsed_url.path)
-            filename, _ = os.path.splitext(filename)
-            
-            if not filename or filename == extension:
-                path_parts = parsed_url.path.rstrip('/').split('/')
-                filename = path_parts[-1] if path_parts else 'unnamed'
-            
-            filename = safe_filename(filename + extension)
-
-            download_dir = os.path.join('downloaded', subfolder)
-            ensure_directory(download_dir)
-
-            # Handle file naming conflicts
-            counter = 1
-            original_filename = filename
-            while os.path.exists(os.path.join(download_dir, filename)):
-                name, ext = os.path.splitext(original_filename)
-                filename = f"{name}_{counter}{ext}"
-                counter += 1
-
-            full_path = os.path.join(download_dir, filename)
-            
-            # Read content and write to file
-            content = await response.read()
-            with open(full_path, 'wb') as file:
-                file.write(content)
-            
-            async with download_lock:
-                successful_downloads += 1
-                progress = (successful_downloads + failed_downloads) / total_urls * 100
-                logger.info(f"Downloaded: {filename} ({progress:.1f}% complete)")
-                
-    except Exception as e:
-        error_type = "other"
-        status_code = None
+        # Decode HTML entities
+        url = html.unescape(url)
         
-        if hasattr(e, 'status'):
-            status_code = e.status
-            if status_code == 404:
-                error_type = "404"
-                async with download_lock:
-                    error_summary[f"HTTP {status_code}"].append(url)
-                    detailed_errors["404"].append({"link": url})
-            elif status_code == 429:
-                error_type = "429"
-                async with download_lock:
-                    error_summary[f"HTTP {status_code}"].append(url)
-                    detailed_errors["429"].append({"link": url})
-            else:
-                async with download_lock:
-                    error_summary[f"HTTP {status_code}"].append(url)
-                    detailed_errors["other"].append({
-                        "link": url,
-                        "reason": f"HTTP {status_code}"
-                    })
-        else:
-            async with download_lock:
-                error_summary["Other errors"].append(f"{url} - {str(e)}")
-                detailed_errors["other"].append({
-                    "link": url,
-                    "reason": str(e)
-                })
+        # Fix URLs that start with slash
+        if url.startswith('/') and not url.startswith('//'):
+            url = 'https:' + url
         
-        # Implement improved retry logic
-        if retry_count < MAX_RETRIES and should_retry(status_code, error_type, str(e)):
-            retry_count += 1
-            # Use shorter, non-blocking delay
-            wait_time = min(RETRY_DELAY * retry_count, 10)  # Cap at 10 seconds
-            logger.debug(f"Retry attempt {retry_count}/{MAX_RETRIES} for {url} after {wait_time} seconds...")
-            await asyncio.sleep(wait_time)
-            return await download_media(session, url, retry_count)
+        # Remove tracking parameters
+        parsed = urlparse(url)
         
-        async with download_lock:
-            failed_downloads += 1
-
-def read_input_file(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        content = file.read()
-
-    if file_path.lower().endswith('.json'):
+        filtered_params = []
+        for key, values in parse_qs(parsed.query).items():
+            if key in ['ex', 'is', 'hm']:
+                filtered_params.extend([f"{key}={v}" for v in values])
+        
+        new_query = '&'.join(filtered_params) if filtered_params else ''
+        new_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if new_query:
+            new_url += f"?{new_query}"
+        
+        return new_url
+    
+    @staticmethod
+    def extract_domain(url: str) -> str:
+        """Extract domain from URL"""
         try:
-            json_data = json.loads(content)
-            if 'settings' in json_data:
-                content = json_data['settings']
+            parsed = urlparse(url)
+            domain = parsed.netloc
+            
+            # Handle special Discord domains
+            if 'images-ext-' in domain:
+                return 'discordapp.net'
+            elif 'cdn.discordapp.com' in domain:
+                return 'cdn.discordapp.com'
+            elif 'media.discordapp.net' in domain:
+                return 'media.discordapp.net'
+            
+            # Extract main domain
+            domain_parts = domain.split('.')
+            if len(domain_parts) >= 2:
+                return f"{domain_parts[-2]}.{domain_parts[-1]}"
+            return domain
+        except:
+            return "unknown"
+    
+    @staticmethod
+    def is_valid_url(url: str) -> bool:
+        """Check if URL is valid"""
+        if not url or len(url) < 10:
+            return False
+        
+        # Must start with http:// or https://
+        if not url.startswith(('http://', 'https://')):
+            # Check if it's a relative URL that can be fixed
+            if url.startswith('//'):
+                url = 'https:' + url
+                return URLResolver.is_valid_url(url)
+            return False
+        
+        try:
+            parsed = urlparse(url)
+            return bool(parsed.scheme and parsed.netloc)
+        except:
+            return False
+    
+    async def resolve_discord_proxy_url(self, client: httpx.AsyncClient, url: str) -> List[str]:
+        """Resolve Discord proxy URLs (images-ext-X.discordapp.net)"""
+        try:
+            parsed = urlparse(url)
+            
+            # Check if it's a Discord proxy URL
+            if 'images-ext-' not in parsed.netloc:
+                return [url]
+            
+            # Extract the actual URL from the path
+            path_parts = parsed.path.split('/')
+            
+            # Look for 'external' in path
+            for i, part in enumerate(path_parts):
+                if part == 'external' and i + 1 < len(path_parts):
+                    # The next part is the encoded URL
+                    encoded_url = '/'.join(path_parts[i+1:])
+                    
+                    # Remove any trailing query/fragment
+                    encoded_url = encoded_url.split('?')[0].split('#')[0]
+                    
+                    # Try to decode
+                    try:
+                        # URL might be base64 encoded or just URL encoded
+                        decoded = unquote(encoded_url)
+                        
+                        # Sometimes it's double encoded
+                        while '%' in decoded:
+                            decoded = unquote(decoded)
+                        
+                        # Ensure it's a full URL
+                        if decoded.startswith('http'):
+                            return [decoded]
+                        elif decoded.startswith('//'):
+                            return ['https:' + decoded]
+                        else:
+                            # Try to reconstruct
+                            return ['https://' + decoded.lstrip('/')]
+                    except:
+                        pass
+            
+            # Also check query parameters
+            query = parse_qs(parsed.query)
+            
+            # Check common query param names
+            for key in ['url', 'src', 'image', 'media']:
+                if key in query:
+                    for value in query[key]:
+                        if value.startswith('http'):
+                            return [value]
+                        elif value.startswith('//'):
+                            return ['https:' + value]
+            
+            # If we can't resolve, return original
+            return [url]
+            
+        except Exception as e:
+            logger.debug(f"Error resolving Discord proxy URL {url}: {e}")
+            return [url]
+    
+    async def resolve_imgur_url(self, client: httpx.AsyncClient, url: str) -> List[str]:
+        """Resolve Imgur URL to direct image URLs"""
+        try:
+            parsed = urlparse(url)
+            if parsed.netloc == 'i.imgur.com':
+                return [url]
+            
+            domain = self.extract_domain(url)
+            await self.rate_limiter.wait_for_domain(domain)
+            
+            try:
+                # Extract Imgur ID
+                path_parts = parsed.path.strip('/').split('/')
+                imgur_id = None
+                
+                if len(path_parts) >= 2 and path_parts[0] in ['a', 'gallery']:
+                    imgur_id = path_parts[1]
+                else:
+                    imgur_id = path_parts[-1].split('.')[0] if path_parts else None
+                
+                if not imgur_id:
+                    return []
+                
+                # Try to get direct image first
+                direct_extensions = ['.jpg', '.png', '.gif', '.mp4', '.webm']
+                for ext in direct_extensions:
+                    test_url = f"https://i.imgur.com/{imgur_id}{ext}"
+                    # We'll let the downloader check if it exists
+                    return [test_url]
+                    
+            finally:
+                self.rate_limiter.release_domain(domain)
+            
+        except Exception as e:
+            logger.debug(f"Error resolving Imgur URL {url}: {e}")
+        
+        return []
+    
+    async def resolve_tenor_url(self, client: httpx.AsyncClient, url: str) -> List[str]:
+        """Resolve Tenor URL to direct media URL"""
+        try:
+            domain = self.extract_domain(url)
+            await self.rate_limiter.wait_for_domain(domain)
+            
+            try:
+                # For Tenor, we'll try to get the MP4 directly
+                # Tenor URLs often have a pattern like /view/name-gif-ID
+                parsed = urlparse(url)
+                path = parsed.path
+                
+                # Extract ID from path
+                if '/view/' in path:
+                    gif_id = path.split('/view/')[1].split('-')[-1]
+                    if gif_id:
+                        # Try different Tenor CDN URLs
+                        possible_urls = [
+                            f"https://media.tenor.com/{gif_id}.mp4",
+                            f"https://media.tenor.com/{gif_id}.gif",
+                            f"https://c.tenor.com/{gif_id}.gif",
+                        ]
+                        return possible_urls
+                
+                return []
+                    
+            finally:
+                self.rate_limiter.release_domain(domain)
+            
+        except Exception as e:
+            logger.debug(f"Error resolving Tenor URL {url}: {e}")
+        
+        return []
+    
+    async def resolve_url(self, client: httpx.AsyncClient, url: str) -> List[str]:
+        """Main URL resolver"""
+        try:
+            # Clean the URL first
+            url = self.clean_url(url)
+            
+            # Validate URL
+            if not self.is_valid_url(url):
+                logger.debug(f"Invalid URL: {url}")
+                return []
+            
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            
+            # Route to appropriate resolver
+            if 'images-ext-' in domain:
+                return await self.resolve_discord_proxy_url(client, url)
+            elif 'tenor.com' in domain:
+                return await self.resolve_tenor_url(client, url)
+            elif 'imgur.com' in domain:
+                return await self.resolve_imgur_url(client, url)
             else:
-                logger.warning("JSON file does not contain 'settings' key. Using raw content.")
-        except json.JSONDecodeError:
-            logger.warning("Invalid JSON format. Using raw content.")
+                return [url]
+                
+        except Exception as e:
+            logger.debug(f"Error in resolve_url for {url}: {e}")
+            return [url] if self.is_valid_url(url) else []
 
-    try:
-        decoded_content = base64.b64decode(content).decode('utf-8', errors='ignore')
-    except (base64.binascii.Error, UnicodeDecodeError):
-        logger.warning("Content is not valid base64 or couldn't be decoded. Using raw content.")
-        decoded_content = content
 
-    return decoded_content
-
-def get_input_file():
-    for ext in ['txt', 'json']:
-        filename = f'data.{ext}'
-        if os.path.exists(filename):
-            return filename
-    logger.error("No valid input file found. Please ensure 'data.txt' or 'data.json' exists.\nNote: If your filename is 'data.txt', only raw data from 'settings' key must be inside of it.")
-    return None
-
-def write_error_log():
-    """Write detailed error information to a JSON file"""
-    ensure_directory('logs')
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    error_log_path = os.path.join('logs', f'error_log_{timestamp}.json')
+class ProtobufParser:
+    """Parse Discord protobuf data"""
     
-    # Remove empty categories
-    cleaned_errors = {k: v for k, v in detailed_errors.items() if v}
+    @staticmethod
+    def extract_urls_simple(data: bytes) -> List[str]:
+        """Simple but effective URL extraction"""
+        urls = set()
+        
+        # Convert to string for regex
+        try:
+            text = data.decode('latin-1')
+        except:
+            text = data.decode('utf-8', errors='ignore')
+        
+        # Improved URL pattern that catches more cases
+        url_patterns = [
+            r'https?://[^\s"\'\x00-\x1F<>)\]]+',  # Main pattern
+            r'//[^\s"\'\x00-\x1F<>)\]]+',  # Protocol-relative URLs
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                # Clean up the URL
+                match = match.rstrip('.\'"')
+                match = match.split('\\x')[0] if '\\x' in match else match
+                match = unquote(match)
+                
+                # Fix protocol-relative URLs
+                if match.startswith('//'):
+                    match = 'https:' + match
+                
+                # Basic validation
+                if match.startswith(('http://', 'https://')) and len(match) > 10:
+                    urls.add(match)
+        
+        return list(urls)
+
+
+class GifDownloader:
+    """Async downloader for Discord favorite GIFs"""
     
-    with open(error_log_path, 'w', encoding='utf-8') as f:
-        json.dump(cleaned_errors, f, indent=4)
+    def __init__(self, base_dir: str = "downloads", max_concurrent: int = 5):
+        self.base_dir = Path(base_dir)
+        self.logs_dir = Path("logs")
+        self.max_concurrent = max_concurrent
+        self.stats = DownloadStats()
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.rate_limiter = RateLimiter()
+        self.client = None
+        self.progress = {"done": 0, "total": 0}
+        self.url_cache = {}
+        self.last_status_length = 0
+        
+    def clear_line(self):
+        """Clear the current line in terminal"""
+        print('\r' + ' ' * self.last_status_length + '\r', end='', flush=True)
+        self.last_status_length = 0
     
-    logger.info(f"Detailed error log written to {error_log_path}")
+    def print_progress(self, status: str = ""):
+        """Print progress bar without overlapping text"""
+        done = self.progress["done"]
+        total = self.progress["total"]
+        
+        if total == 0:
+            return
+        
+        # Clear previous line
+        self.clear_line()
+        
+        # Calculate progress
+        percent = (done / total) * 100
+        bar_length = 30
+        filled_length = int(bar_length * done // total)
+        bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        
+        # Build status line
+        status_line = f"[{bar}] {percent:.1f}% ({done}/{total})"
+        if status:
+            status_line += f" {status}"
+        
+        # Print and track length
+        print(status_line, end='', flush=True)
+        self.last_status_length = len(status_line)
+        
+        if done >= total:
+            print()
+            self.last_status_length = 0
+    
+    def setup_folders(self):
+        """Create folder structure"""
+        self.base_dir.mkdir(exist_ok=True)
+        self.logs_dir.mkdir(exist_ok=True)
+        
+        for _, folder_name in MEDIA_TYPES.values():
+            (self.base_dir / folder_name).mkdir(exist_ok=True)
+    
+    async def get_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client"""
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+                max_redirects=5,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'image/webp,image/*,*/*;q=0.8',
+                }
+            )
+        return self.client
+    
+    async def close_client(self):
+        """Close HTTP client"""
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+    
+    def sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename"""
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        
+        while '__' in filename:
+            filename = filename.replace('__', '_')
+        
+        if len(filename) > 150:
+            name, ext = os.path.splitext(filename)
+            filename = name[:150 - len(ext)] + ext
+        
+        return filename.strip('_. ')
+    
+    def get_file_extension(self, url: str, content_type: str) -> str:
+        """Get appropriate file extension"""
+        content_type = content_type.split(';')[0].strip().lower()
+        
+        if content_type in MEDIA_TYPES:
+            return MEDIA_TYPES[content_type][0]
+        
+        # Guess from URL
+        url_lower = url.lower()
+        if '.gif' in url_lower or url_lower.endswith('.gif'):
+            return '.gif'
+        elif '.mp4' in url_lower or url_lower.endswith('.mp4'):
+            return '.mp4'
+        elif '.webm' in url_lower or url_lower.endswith('.webm'):
+            return '.webm'
+        elif '.webp' in url_lower or url_lower.endswith('.webp'):
+            return '.webp'
+        elif '.jpg' in url_lower or '.jpeg' in url_lower:
+            return '.jpg'
+        elif '.png' in url_lower or url_lower.endswith('.png'):
+            return '.png'
+        elif '.mov' in url_lower or url_lower.endswith('.mov'):
+            return '.mov'
+        
+        # Try mimetypes
+        guessed = mimetypes.guess_extension(content_type)
+        if guessed:
+            return guessed
+        
+        return '.bin'
+    
+    def get_folder_name(self, extension: str) -> str:
+        """Get folder name based on extension"""
+        extension = extension.lower()
+        
+        if extension in ['.gif']:
+            return 'gif'
+        elif extension in ['.mp4', '.webm', '.mov']:
+            return 'mp4'
+        elif extension in ['.jpg', '.jpeg', '.png', '.webp']:
+            return 'img'
+        else:
+            return 'other'
+    
+    def get_file_path(self, url: str, content_type: str, index: int) -> Path:
+        """Determine file path"""
+        extension = self.get_file_extension(url, content_type)
+        folder = self.get_folder_name(extension)
+        
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path)
+        
+        if not filename or filename == '/':
+            import hashlib
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            filename = f"file_{index}_{url_hash}{extension}"
+        else:
+            name, ext = os.path.splitext(filename)
+            if not ext or ext.lower() != extension.lower():
+                filename = f"{name}_{index}{extension}"
+            else:
+                filename = f"{name}_{index}{ext}"
+        
+        filename = self.sanitize_filename(filename)
+        return self.base_dir / folder / filename
+    
+    async def resolve_urls(self, urls: List[str]) -> List[str]:
+        """Resolve special URLs"""
+        print(f"\nResolving special URLs...")
+        
+        resolver = URLResolver(self.rate_limiter)
+        resolved_urls = []
+        client = await self.get_client()
+        
+        for i, url in enumerate(urls):
+            try:
+                if url in self.url_cache:
+                    resolved_urls.extend(self.url_cache[url])
+                    continue
+                
+                # Show simple progress
+                if i % 10 == 0:
+                    print(f"\rResolving: {i+1}/{len(urls)}", end="", flush=True)
+                
+                resolved = await resolver.resolve_url(client, url)
+                
+                if resolved:
+                    self.url_cache[url] = resolved
+                    resolved_urls.extend(resolved)
+                    self.stats.resolved += 1
+                else:
+                    resolved_urls.append(url)
+                    
+            except Exception as e:
+                logger.debug(f"Failed to resolve {url}: {e}")
+                resolved_urls.append(url)
+        
+        print(f"\rResolved {self.stats.resolved} URLs")
+        return resolved_urls
+    
+    async def download_file(self, url: str, index: int) -> bool:
+        """Download a single file"""
+        async with self.semaphore:
+            try:
+                # Validate URL first
+                if not URLResolver.is_valid_url(url):
+                    error_msg = "Invalid URL"
+                    self.stats.add_error(url, error_msg)
+                    self.stats.failed += 1
+                    self.progress["done"] += 1
+                    self.print_progress("invalid")
+                    return False
+                
+                client = await self.get_client()
+                domain = URLResolver.extract_domain(url)
+                await self.rate_limiter.wait_for_domain(domain)
+                
+                try:
+                    # Skip HEAD request to reduce requests
+                    content_type = 'application/octet-stream'
+                    
+                    # Get file path
+                    file_path = self.get_file_path(url, content_type, index)
+                    
+                    # Check if file already exists
+                    if file_path.exists():
+                        self.stats.skipped += 1
+                        self.progress["done"] += 1
+                        self.print_progress("exists")
+                        return True
+                    
+                    # Download with timeout
+                    timeout = httpx.Timeout(30.0, connect=10.0)
+                    response = await client.get(url, timeout=timeout)
+                    
+                    # Check for errors
+                    if response.status_code == 404:
+                        error_msg = "HTTP 404"
+                        self.stats.add_error(url, error_msg)
+                        self.stats.failed += 1
+                        self.progress["done"] += 1
+                        self.print_progress("404")
+                        return False
+                    elif response.status_code == 429:
+                        error_msg = "Rate limited"
+                        self.stats.add_error(url, error_msg)
+                        self.stats.failed += 1
+                        self.progress["done"] += 1
+                        self.print_progress("429")
+                        return False
+                    
+                    response.raise_for_status()
+                    
+                    # Get content type
+                    actual_content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+                    if actual_content_type:
+                        content_type = actual_content_type
+                    
+                    # Skip HTML
+                    if content_type.lower() == 'text/html':
+                        self.stats.unsupported += 1
+                        self.progress["done"] += 1
+                        self.print_progress("html")
+                        return False
+                    
+                    # Get content
+                    content = response.content
+                    
+                    # Check for error pages
+                    if len(content) > 500:
+                        text_preview = content[:1000].decode('latin-1', errors='ignore').lower()
+                        if any(error in text_preview for error in ['error', 'not found', '404', '403', 'unavailable']):
+                            raise Exception("Error page")
+                    
+                    # Update file path
+                    file_path = self.get_file_path(url, content_type, index)
+                    
+                    # Save file
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_bytes(content)
+                    
+                    # Update stats
+                    self.stats.successful += 1
+                    self.stats.downloaded_files.append(str(file_path))
+                    
+                    # Show success with clean output
+                    file_size = len(content)
+                    size_str = f"{file_size:,}B"
+                    if file_size > 1024*1024:
+                        size_str = f"{file_size/(1024*1024):.1f}MB"
+                    elif file_size > 1024:
+                        size_str = f"{file_size/1024:.1f}KB"
+                    
+                    self.progress["done"] += 1
+                    short_name = file_path.name[:15] + "..." if len(file_path.name) > 15 else file_path.name
+                    self.print_progress(f"{short_name} ({size_str})")
+                    return True
+                        
+                finally:
+                    self.rate_limiter.release_domain(domain)
+                    
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    error_msg = "HTTP 404"
+                    self.stats.not_found += 1
+                elif e.response.status_code == 429:
+                    error_msg = "HTTP 429"
+                    self.stats.rate_limited += 1
+                else:
+                    error_msg = f"HTTP {e.response.status_code}"
+                self.stats.add_error(url, error_msg)
+                self.stats.failed += 1
+                self.progress["done"] += 1
+                self.print_progress(f"HTTP {e.response.status_code}")
+                return False
+            except httpx.TimeoutException:
+                error_msg = "Timeout"
+                self.stats.add_error(url, error_msg)
+                self.stats.failed += 1
+                self.progress["done"] += 1
+                self.print_progress("timeout")
+                return False
+            except Exception as e:
+                error_msg = str(e)[:30]
+                self.stats.add_error(url, error_msg)
+                self.stats.failed += 1
+                self.progress["done"] += 1
+                self.print_progress("error")
+                return False
+    
+    async def download_all(self, urls: List[str]):
+        """Download all URLs"""
+        self.stats.total = len(urls)
+        self.stats.start_time = datetime.now()
+        self.progress = {"done": 0, "total": len(urls)}
+        
+        print(f"\nStarting download of {self.stats.total} files")
+        print(f"Output folder: {self.base_dir.absolute()}")
+        print(f"Max concurrent: {self.max_concurrent}")
+        print("-" * 50)
+        
+        # Create tasks
+        tasks = []
+        for i, url in enumerate(urls):
+            task = asyncio.create_task(self.download_file(url, i))
+            tasks.append(task)
+        
+        # Wait for all tasks
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            print(f"\nWarning: {e}")
+        
+        # Close client
+        await self.close_client()
+        
+        self.stats.end_time = datetime.now()
+        print()  # Clear the progress line
+    
+    def print_statistics(self):
+        """Print download statistics"""
+        print("\n" + "="*50)
+        print("DOWNLOAD STATISTICS")
+        print("="*50)
+        
+        duration = self.stats.duration
+        mins, secs = divmod(duration, 60)
+        time_str = f"{int(mins)}m {int(secs)}s"
+        
+        print(f"Total URLs:          {self.stats.total}")
+        print(f"Successfully saved:  {self.stats.successful}")
+        print(f"Skipped (exists):    {self.stats.skipped}")
+        print(f"Failed downloads:    {self.stats.failed}")
+        print(f"  - 404 Not Found:   {self.stats.not_found}")
+        print(f"  - Rate limited:    {self.stats.rate_limited}")
+        print(f"URLs resolved:       {self.stats.resolved}")
+        
+        if self.stats.total > 0:
+            success_rate = self.stats.success_rate
+            print(f"Success rate:        {success_rate:.1f}%")
+            
+            # Add user feedback about success rate
+            if success_rate >= 70:
+                print(f"Status:              Excellent! ({success_rate:.1f}% success)")
+            elif success_rate >= 50:
+                print(f"Status:              Good ({success_rate:.1f}% success)")
+            elif success_rate >= 30:
+                print(f"Status:              Normal ({success_rate:.1f}% success - many gifs actually saved)")
+            else:
+                print(f"Status:              Low ({success_rate:.1f}% success - you should be good for the most part)")
+        
+        print(f"Time elapsed:        {time_str}")
+        print("="*50)
+        
+        # Show downloaded files summary
+        if self.stats.downloaded_files:
+            print(f"\nDownloaded to folders:")
+            folders = {}
+            for file in self.stats.downloaded_files:
+                folder = Path(file).parent.name
+                folders[folder] = folders.get(folder, 0) + 1
+            
+            for folder, count in sorted(folders.items()):
+                print(f"  {folder}/ - {count} file{'s' if count != 1 else ''}")
+    
+    def save_reports(self):
+        """Save reports to logs folder"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save failed URLs
+        if self.stats.failed_urls:
+            failed_path = self.logs_dir / f"failed_urls_{timestamp}.txt"
+            with open(failed_path, 'w', encoding='utf-8') as f:
+                f.write(f"Failed URLs - {timestamp}\n")
+                f.write("="*60 + "\n\n")
+                for url, error in self.stats.failed_urls.items():
+                    f.write(f"{url}\n")
+                    f.write(f"Error: {error}\n\n")
+            print(f"Failed URLs saved: {failed_path}")
+        
+        # Save successful downloads list
+        if self.stats.downloaded_files:
+            list_path = self.logs_dir / f"downloaded_files_{timestamp}.txt"
+            with open(list_path, 'w', encoding='utf-8') as f:
+                f.write(f"Downloaded Files - {timestamp}\n")
+                f.write("="*60 + "\n\n")
+                for file in self.stats.downloaded_files:
+                    f.write(f"{file}\n")
+            print(f"File list saved: {list_path}")
+        
+        # Save statistics
+        stats_path = self.logs_dir / f"statistics_{timestamp}.json"
+        stats_data = {
+            "timestamp": datetime.now().isoformat(),
+            "total_urls": self.stats.total,
+            "successful": self.stats.successful,
+            "skipped": self.stats.skipped,
+            "failed": self.stats.failed,
+            "not_found": self.stats.not_found,
+            "rate_limited": self.stats.rate_limited,
+            "resolved": self.stats.resolved,
+            "success_rate": self.stats.success_rate,
+            "duration_seconds": self.stats.duration,
+            "output_folder": str(self.base_dir.absolute()),
+        }
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(stats_data, f, indent=2)
+        print(f"Statistics saved: {stats_path}")
+
 
 async def main():
-    global total_urls
+    """Main function"""
+    print("Discord Favorite GIF Downloader")
+    print("Author: nloginov")
+    print("="*50)
     
-    input_file = get_input_file()
+    # Find input file
+    input_files = ['data.json', 'data.txt', 'input.json', 'input.txt']
+    input_file = None
+    
+    for filename in input_files:
+        if os.path.exists(filename):
+            input_file = filename
+            break
+    
     if not input_file:
-        return
-
-    decoded_content = read_input_file(input_file)
-    urls = extract_and_fix_urls(decoded_content)
-    total_urls = len(urls)
-
-    logger.info(f"Found {total_urls} URLs to process")
-    logger.info(f"Using {MAX_CONCURRENT_DOWNLOADS} concurrent downloads")
-
-    # Create aiohttp session with improved settings
-    connector = aiohttp.TCPConnector(
-        limit=MAX_CONCURRENT_DOWNLOADS * 2,
-        limit_per_host=MAX_CONCURRENT_DOWNLOADS,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-        ssl=False  # Allow SSL errors to be handled per-request
-    )
+        print("Error: No input file found!")
+        print("Please create one of these files:")
+        for filename in input_files[:2]:
+            print(f"  {filename}")
+        sys.exit(1)
     
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    print(f"Reading from: {input_file}")
     
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    ) as session:
-        # Create semaphore to limit concurrent downloads
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    # Read and parse input data
+    try:
+        with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().strip()
         
-        async def download_with_semaphore(url):
-            async with semaphore:
-                try:
-                    await download_media(session, url)
-                except Exception as e:
-                    logger.error(f"Unhandled exception for {url}: {e}")
-                    async with download_lock:
-                        detailed_errors["other"].append({
-                            "link": url,
-                            "reason": f"Unhandled: {str(e)}"
-                        })
-
-        # Create tasks for all URLs
-        tasks = [download_with_semaphore(url) for url in urls]
+        if not content:
+            print("Error: Input file is empty")
+            sys.exit(1)
         
-        # Execute all downloads concurrently
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Parse JSON if needed
+        if input_file.endswith('.json'):
+            try:
+                data = json.loads(content)
+                content = data.get('settings', '')
+                if not content:
+                    print("Error: JSON file doesn't contain 'settings' key")
+                    sys.exit(1)
+            except json.JSONDecodeError:
+                print("Warning: Invalid JSON, treating as raw data")
+        
+        # Decode base64
+        try:
+            protobuf_data = base64.b64decode(content)
+            print(f"Decoded {len(protobuf_data):,} bytes")
+        except:
+            print("Warning: Not valid base64, treating as raw text")
+            protobuf_data = content.encode('utf-8')
+        
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        sys.exit(1)
+    
+    # Extract URLs
+    print("\nExtracting URLs...")
+    parser = ProtobufParser()
+    urls = parser.extract_urls_simple(protobuf_data)
+    
+    if not urls:
+        print("Error: No URLs found!")
+        sys.exit(1)
+    
+    print(f"Found {len(urls):,} unique URLs")
+    
+    # Filter URLs
+    filtered_urls = []
+    for url in urls:
+        if URLResolver.is_valid_url(url) and len(url) > 10 and not url.startswith('data:'):
+            filtered_urls.append(url)
+    
+    print(f"After filtering: {len(filtered_urls):,} valid URLs")
+    
+    # Initialize downloader
+    downloader = GifDownloader(base_dir="downloads", max_concurrent=5)
+    downloader.setup_folders()
+    
+    # Resolve special URLs
+    resolved_urls = await downloader.resolve_urls(filtered_urls)
+    print(f"After resolution: {len(resolved_urls):,} URLs to download")
+    
+    # Download files
+    await downloader.download_all(resolved_urls)
+    
+    # Print statistics and save reports
+    downloader.print_statistics()
+    downloader.save_reports()
+    
+    # Final summary
+    print("\n" + "="*50)
+    if downloader.stats.successful > 0:
+        print(f"Download complete: {downloader.stats.successful} files saved")
+        print(f"Location: downloads/ folder")
+    else:
+        print("No files were downloaded")
+        print("Note: Many Discord files get deleted over time")
+    print("="*50)
 
-    # Write detailed error log to file
-    if any(detailed_errors.values()):
-        write_error_log()
-
-    # Print statistics
-    logger.info("\n--- Download Statistics ---")
-    logger.info(f"Total URLs processed: {total_urls}")
-    logger.info(f"Successful downloads: {successful_downloads}")
-    logger.info(f"Failed downloads: {failed_downloads}")
-    if total_urls > 0:
-        logger.info(f"Success rate: {successful_downloads/total_urls*100:.1f}%")
-
-    # Print error summary
-    if error_summary:
-        logger.info("\n--- Error Summary ---")
-        for error_type, urls in error_summary.items():
-            logger.info(f"{error_type}: {len(urls)} occurrences")
-            if error_type == "HTTP 404":
-                logger.info("Sample URLs (max 5):")
-                for url in urls[:5]:
-                    logger.info(f"  - {url}")
-            elif len(urls) <= 5:
-                for url in urls:
-                    logger.info(f"  - {url}")
-            else:
-                logger.info(f"  (Showing first 5 of {len(urls)} errors)")
-                for url in urls[:5]:
-                    logger.info(f"  - {url}")
-                logger.info(f"  See error log file for complete list")
-
-    # Pause for 10 seconds
-    logger.info("\nScript finished. Exiting in 10 seconds...")
-    await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\nDownload interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        sys.exit(1)
